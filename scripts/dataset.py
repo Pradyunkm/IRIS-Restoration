@@ -27,7 +27,7 @@ on samples 000040, 000052, 000064):
   changes -- only dtype/tensor conversion.
 
 Usage (quick self-test):
-    python dataset.py --data_root "C:\\Users\\sekuh\\Desktop\\semicon\\train"
+    python dataset.py --data_root "D:\\VSProjects\\IRIS---Restoration-main\\dataset\\train\\train"
 """
 
 import argparse
@@ -161,8 +161,9 @@ def _self_test(data_root: str):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="IRIS paired dataset self-test")
-    parser.add_argument("--data_root", type=str, required=True,
-                         help=r'e.g. "C:\Users\sekuh\Desktop\semicon\train"')
+    parser.add_argument("--data_root", type=str,
+                        default=r"D:\VSProjects\IRIS---Restoration-main\dataset\train\train",
+                        help=r'Path to train folder, e.g. D:\VSProjects\IRIS---Restoration-main\dataset\train\train')
     args = parser.parse_args()
 
     _self_test(args.data_root)

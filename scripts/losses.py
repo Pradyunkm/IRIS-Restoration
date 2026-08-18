@@ -1,10 +1,18 @@
 """
 losses.py
 
-Differentiable loss terms for Experiment 2 (baseline + structural + edge
-loss), per the report's Section 10:
+Differentiable loss terms for Experiments 2–6:
 
-    L = lambda_pixel * L_pixel + lambda_struct * L_struct + lambda_edge * L_edge
+    L = lambda_pixel * L_pixel + lambda_struct * L_struct
+      + lambda_edge * L_edge + lambda_freq * L_freq (Exp 6+)
+
+New in Exp 6:
+- L_freq : L1 loss in the Fourier frequency domain (rfft2). Penalizes
+           errors in high-frequency content (edges, textures, fine detail)
+           that Charbonnier / SSIM losses tend to smooth away because they
+           operate purely in the spatial domain. Used in NAFNet, Restormer,
+           and recent SOTA denoisers. Weight: lambda_freq=0.05 (small but
+           complementary to the spatial terms).
 
 - L_pixel   : Charbonnier (same as the Phase 2 baseline -- keeps the basic
               pixel-fidelity signal so this experiment is additive, not a
@@ -90,40 +98,75 @@ class EdgeLoss(nn.Module):
         return torch.abs(grad_pred - grad_target).mean()
 
 
+class FFTLoss(nn.Module):
+    """
+    L1 loss in the 2-D frequency domain (torch.fft.rfft2).
+
+    Penalizes errors in amplitude and phase of each frequency component,
+    which directly targets high-frequency detail that spatial losses miss.
+    This is the same loss used in NAFNet and Restormer.
+
+    Works on single-channel (B,1,H,W) tensors; generalises trivially
+    to multi-channel inputs.
+    """
+
+    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        pred_fft   = torch.fft.rfft2(pred,   norm="ortho")
+        target_fft = torch.fft.rfft2(target, norm="ortho")
+        # L1 on complex magnitudes avoids phase-wrapping instability
+        loss_real  = torch.abs(pred_fft.real - target_fft.real).mean()
+        loss_imag  = torch.abs(pred_fft.imag - target_fft.imag).mean()
+        return loss_real + loss_imag
+
+
 class CombinedLoss(nn.Module):
     """
-    L = lambda_pixel * Charbonnier + lambda_struct * (1-SSIM) + lambda_edge * EdgeL1
+    L = lambda_pixel * Charbonnier
+      + lambda_struct * (1-SSIM)
+      + lambda_edge  * EdgeL1
+      + lambda_freq  * FFT_L1      (optional, 0.0 disables it)
 
     Returns both the total loss and a dict of the individual (unweighted)
-    components, so train_exp2.py can log each term separately -- useful
+    components, so training scripts can log each term separately -- useful
     for checking whether one term is dominating/starving the others.
     """
 
-    def __init__(self, lambda_pixel: float = 1.0, lambda_struct: float = 0.2, lambda_edge: float = 0.3):
+    def __init__(
+        self,
+        lambda_pixel: float = 1.0,
+        lambda_struct: float = 0.2,
+        lambda_edge: float = 0.3,
+        lambda_freq: float = 0.0,   # set to 0.05 for Exp 6+
+    ):
         super().__init__()
-        self.lambda_pixel = lambda_pixel
+        self.lambda_pixel  = lambda_pixel
         self.lambda_struct = lambda_struct
-        self.lambda_edge = lambda_edge
-        self.ssim_loss = SSIMLoss()
-        self.edge_loss = EdgeLoss()
+        self.lambda_edge   = lambda_edge
+        self.lambda_freq   = lambda_freq
+        self.ssim_loss     = SSIMLoss()
+        self.edge_loss     = EdgeLoss()
+        self.fft_loss      = FFTLoss()
 
     def forward(self, pred: torch.Tensor, target: torch.Tensor):
         pred_clipped = pred.clamp(0.0, 1.0)
 
-        l_pixel = charbonnier_loss(pred, target)
+        l_pixel  = charbonnier_loss(pred, target)
         l_struct = self.ssim_loss(pred_clipped, target)
-        l_edge = self.edge_loss(pred_clipped, target)
+        l_edge   = self.edge_loss(pred_clipped, target)
+        l_freq   = self.fft_loss(pred_clipped, target)
 
         total = (
-            self.lambda_pixel * l_pixel
+            self.lambda_pixel  * l_pixel
             + self.lambda_struct * l_struct
-            + self.lambda_edge * l_edge
+            + self.lambda_edge   * l_edge
+            + self.lambda_freq   * l_freq
         )
 
         components = {
-            "pixel": l_pixel.item(),
+            "pixel":  l_pixel.item(),
             "struct": l_struct.item(),
-            "edge": l_edge.item(),
+            "edge":   l_edge.item(),
+            "freq":   l_freq.item(),
         }
         return total, components
 

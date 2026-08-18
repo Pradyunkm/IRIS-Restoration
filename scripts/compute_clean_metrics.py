@@ -30,6 +30,7 @@ from torch.utils.data import DataLoader
 from dataset import make_train_val_split
 from model import IRISBaseline, IRISStronger
 from model_conditioned import IRISConditioned
+from model_nafnet import NAFNetIRIS
 
 
 KNOWN_CORRUPTED_IDS = {"002637", "002973"}  # confirmed pure-noise GT, no learnable structure
@@ -67,11 +68,30 @@ def compute_ssim(pred: torch.Tensor, target: torch.Tensor) -> float:
     return ssim_map.mean().item()
 
 
-def evaluate_checkpoint(model, val_set, device):
-    """Per-sample evaluation (batch_size=1) so we can exclude specific
-    file_ids from the 'clean' aggregate without recomputing anything."""
-    loader = DataLoader(val_set, batch_size=1, shuffle=False, num_workers=0)
+def _augment(x, mode):
+    if mode == 0: return x
+    if mode == 1: return torch.flip(x, dims=[3])
+    if mode == 2: return torch.flip(x, dims=[2])
+    if mode == 3: return torch.rot90(x, k=1, dims=[2, 3])
+    if mode == 4: return torch.rot90(x, k=2, dims=[2, 3])
+    if mode == 5: return torch.rot90(x, k=3, dims=[2, 3])
+    if mode == 6: return torch.flip(torch.rot90(x, k=1, dims=[2, 3]), dims=[3])
+    if mode == 7: return torch.flip(torch.rot90(x, k=1, dims=[2, 3]), dims=[2])
+    return x
 
+def _inverse_augment(x, mode):
+    if mode == 0: return x
+    if mode == 1: return torch.flip(x, dims=[3])
+    if mode == 2: return torch.flip(x, dims=[2])
+    if mode == 3: return torch.rot90(x, k=3, dims=[2, 3])
+    if mode == 4: return torch.rot90(x, k=2, dims=[2, 3])
+    if mode == 5: return torch.rot90(x, k=1, dims=[2, 3])
+    if mode == 6: return torch.flip(x, dims=[3])
+    if mode == 7: return torch.flip(x, dims=[2])
+    return x
+
+def evaluate_checkpoint(model, val_set, device, use_tta=False):
+    loader = DataLoader(val_set, batch_size=1, shuffle=False, num_workers=0)
     official_psnr, official_ssim = [], []
     clean_psnr, clean_ssim = [], []
 
@@ -81,7 +101,16 @@ def evaluate_checkpoint(model, val_set, device):
             gt = batch["gt"].to(device)
             file_id = batch["file_id"][0]
 
-            pred = model(noisy)
+            if use_tta:
+                preds = []
+                for m in range(8):
+                    aug_in = _augment(noisy, m)
+                    aug_pred = model(aug_in).clamp(0.0, 1.0)
+                    preds.append(_inverse_augment(aug_pred, m))
+                pred = torch.stack(preds, dim=0).mean(dim=0)
+            else:
+                pred = model(noisy)
+
             psnr = compute_psnr(pred, gt)
             ssim = compute_ssim(pred, gt)
 
@@ -115,16 +144,18 @@ def main():
     _, val_set = make_train_val_split(args.data_root, val_fraction=args.val_fraction, seed=args.seed)
 
     experiments = [
-        ("Experiment 1 (baseline)", "checkpoints/best.pt", "baseline"),
-        ("Experiment 2 (+ struct/edge loss)", "checkpoints_exp2/best.pt", "baseline"),
-        ("Experiment 3 (+ capacity)", "checkpoints_exp3/best.pt", "stronger"),
-        ("Experiment 4 (+ synthetic augmentation)", "checkpoints_exp4/best.pt", "stronger"),
-        ("Experiment 5 (+ degradation conditioning)", "checkpoints_exp5/best.pt", "conditioned"),
+        ("Experiment 1 (baseline)", "checkpoints/best.pt", "baseline", False),
+        ("Experiment 2 (+ struct/edge loss)", "checkpoints_exp2/best.pt", "baseline", False),
+        ("Experiment 3 (+ capacity)", "checkpoints_exp3/best.pt", "stronger", False),
+        ("Experiment 4 (+ synthetic augmentation)", "checkpoints_exp4/best.pt", "stronger", False),
+        ("Experiment 5 (+ degradation conditioning)", "checkpoints_exp5/best.pt", "conditioned", False),
+        ("Experiment 6 (+ NAFNet + FFT + EMA)", "checkpoints_exp6/best.pt", "nafnet", False),
+        ("Experiment 6 (+ NAFNet + FFT + EMA + 8-way TTA)", "checkpoints_exp6/best.pt", "nafnet", True),
     ]
 
     results = []
 
-    for name, ckpt_path, model_type in experiments:
+    for name, ckpt_path, model_type, use_tta in experiments:
         try:
             checkpoint = torch.load(ckpt_path, map_location=device, weights_only=False)
         except FileNotFoundError:
@@ -135,12 +166,14 @@ def main():
             model = IRISStronger(channels=112, num_res_blocks=16).to(device)
         elif model_type == "conditioned":
             model = IRISConditioned(channels=112, num_res_blocks=16, embed_dim=32).to(device)
+        elif model_type == "nafnet":
+            model = NAFNetIRIS(width=32, enc_blks=[1, 1, 1, 28], middle_blks=1, dec_blks=[1, 1, 1, 1]).to(device)
         else:
             model = IRISBaseline(channels=64, num_res_blocks=8).to(device)
         model.load_state_dict(checkpoint["model_state"])
         model.eval()
 
-        metrics = evaluate_checkpoint(model, val_set, device)
+        metrics = evaluate_checkpoint(model, val_set, device, use_tta=use_tta)
         metrics["name"] = name
         results.append(metrics)
 
