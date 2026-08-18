@@ -116,6 +116,33 @@ results/ablation_plots.png      PSNR/SSIM training curves, all five experiments
 reference/reproducibility; their training logs are in `log.csv` in each
 folder. Experiment 5 is the submitted model.
 
+## Setup
+
+**Requirements:** Python 3.8+
+
+```bash
+# 1. Clone the repository (Git LFS required for model weights)
+git lfs install
+git clone https://github.com/Pradyunkm/IRIS-Restoration.git
+cd IRIS-Restoration
+
+# 2. Create and activate a virtual environment
+python -m venv venv
+
+# On Windows:
+venv\Scripts\activate
+# On macOS/Linux:
+source venv/bin/activate
+
+# 3. Install dependencies
+pip install -r requirements.txt
+```
+
+> **Note:** Git LFS must be installed to download the `.pt` model checkpoint files.
+> Install it from [git-lfs.com](https://git-lfs.github.com/) before cloning.
+
+---
+
 ## Running inference
 
 ```bash
