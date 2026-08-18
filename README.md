@@ -33,12 +33,15 @@ python run.py <input-dir> <output-dir>
 | `<output-dir>` | Directory where restored `.npy` files (`256×256`, `float32`, `[0,1]`) will be saved |
 
 #### Key Features of `run.py`:
-- ✅ Reads all `.npy` files from input directory.
+- ✅ Reads **all** `.npy` files from the input directory (scales to any count — 400, 3200, or more).
 - ✅ Creates the output directory if it does not already exist.
 - ✅ Produces one matching output `.npy` for every input file with identical filename.
 - ✅ Guaranteed `(256, 256)` float32 grayscale, clamped to `[0, 1]` with no NaN / Inf values.
 - ✅ 100% self-contained & offline (no internet access, API keys, or manual config needed).
 - ✅ 8-way Test-Time Augmentation (TTA) ensemble on GPU.
+- ✅ **Auto-retraining check** — automatically fine-tunes the model if new labeled data is present in `new_data/` before returning.
+
+> **Note on output file count**: `run.py` restores exactly as many images as are present in the input directory — there is no hard-coded limit. If the test set has 3200 images, all 3200 will be processed. The number of outputs always equals the number of valid `.npy` inputs found.
 
 ---
 
@@ -72,7 +75,7 @@ flowchart TD
    # Or run one-shot:
    python scripts/auto_retrain.py --once
    ```
-3. When running `python Team-LML/run.py <input-dir> <output-dir>`, the system also automatically checks for new training data in `new_data/` and updates the model if performance improves.
+3. When running `python Team-LML/run.py <input-dir> <output-dir>`, the system also automatically checks for new training data in `new_data/` and fine-tunes the model **before returning** if new data is found.
 
 ---
 
@@ -118,10 +121,10 @@ IRIS-Restoration/
 │   ├── requirements.txt        # Pinned dependencies
 │   ├── README.md               # Submission-specific documentation
 │   └── models/
-│       └── best.pt             # Trained Experiment 6 NAFNet weights
+│       └── best.pt             # Trained Experiment 6 NAFNet weights (Git LFS)
 ├── new_data/                   # Staging drop folder for continuous retraining
-│   ├── NoisyLR/                # Drop new 128x128 noisy .npy files
-│   └── GT/                     # Drop new 256x256 ground truth .npy files
+│   ├── NoisyLR/                # Drop new 128x128 noisy .npy files here
+│   └── GT/                     # Drop new 256x256 ground truth .npy files here
 ├── scripts/
 │   ├── auto_retrain.py         # Full auto-retrain and model hot-swapping daemon
 │   ├── model_nafnet.py         # NAFNet UNet architecture
@@ -131,8 +134,20 @@ IRIS-Restoration/
 │   ├── evaluate.py             # Model evaluation and benchmarking script
 │   └── ...
 ├── checkpoints_exp6/           # Experiment 6 checkpoints & training history
-│   ├── best.pt
-│   ├── log.csv
-│   └── retrain_history.csv
+│   ├── best.pt                 # Best model checkpoint (Git LFS)
+│   ├── last.pt                 # Latest epoch checkpoint (Git LFS)
+│   ├── log.csv                 # Per-epoch training log
+│   └── retrain_history.csv     # Auto-retrain cycle history
 └── README.md
 ```
+
+## ❓ Troubleshooting
+
+**Q: `run.py` only produced N outputs but I expected more.**
+A: `run.py` outputs exactly one restored file per valid `.npy` input found in `<input-dir>`. If fewer files are output than expected, check that all input files are present in the input directory, are named as `NNNNNN.npy`, and have shape `(128, 128)` float32. The script prints a warning for any files it skips.
+
+**Q: Auto-retrain didn't trigger when I ran `run.py`.**
+A: The auto-retrain trigger checks `new_data/NoisyLR/` and `new_data/GT/` for matched `.npy` pairs. If no new paired data is found there, the pipeline correctly skips retraining and prints a message telling you where to drop new data. It does **not** use the test input directory for training.
+
+**Q: `WARNING: Could not import auto_retrain module`.**
+A: Make sure `scripts/auto_retrain.py` is present and all dependencies (`torch`, `numpy`, `tqdm`) are installed. Run `pip install -r Team-LML/requirements.txt`. Pass `--no_auto_train` to skip the check entirely.

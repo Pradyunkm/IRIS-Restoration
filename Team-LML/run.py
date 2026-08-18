@@ -247,15 +247,29 @@ def trigger_auto_retrain_if_new_data_present(verbose: bool = True):
     Checks if new paired training data exists in new_data/.
     If found, runs the auto-retraining pipeline to fine-tune the model,
     evaluate on validation set, and replace models/best.pt if accuracy improves.
+
+    Drop new training pairs into:
+      new_data/NoisyLR/NNNNNN.npy  (128x128 float32)
+      new_data/GT/NNNNNN.npy       (256x256 float32)
+    before running run.py, and the model will be automatically fine-tuned.
     """
     root_dir = Path(__file__).resolve().parent.parent
     scripts_dir = root_dir / "scripts"
     if str(scripts_dir) not in sys.path:
         sys.path.insert(0, str(scripts_dir))
 
+    print("\n[Auto-Train] Checking for new training data in new_data/ ...", flush=True)
+
     try:
-        from auto_retrain import retrain_cycle, find_new_pairs, DATA_ROOT, NEW_DATA_DIR, CHECKPOINT_DIR, PRODUCTION_DIR, ARCHIVE_DIR, HISTORY_CSV
-    except ImportError:
+        from auto_retrain import (
+            retrain_cycle, find_new_pairs,
+            DATA_ROOT, NEW_DATA_DIR, CHECKPOINT_DIR,
+            PRODUCTION_DIR, ARCHIVE_DIR, HISTORY_CSV,
+        )
+    except ImportError as e:
+        print(f"[Auto-Train] WARNING: Could not import auto_retrain module ({e}).", flush=True)
+        print(f"[Auto-Train]          Make sure scripts/ is accessible at: {scripts_dir}", flush=True)
+        print("[Auto-Train] Skipping auto-retrain check.", flush=True)
         return
 
     new_data_dir = NEW_DATA_DIR
@@ -263,33 +277,39 @@ def trigger_auto_retrain_if_new_data_present(verbose: bool = True):
 
     if not new_pairs:
         if verbose:
-            print("[Auto-Train] Checked new_data/ — no new paired data. Current model is up-to-date.", flush=True)
+            print(
+                f"[Auto-Train] No new paired data found in {new_data_dir}.\n"
+                f"[Auto-Train] To trigger retraining, drop matching .npy files into:\n"
+                f"[Auto-Train]   {new_data_dir / 'NoisyLR'}  (128x128 inputs)\n"
+                f"[Auto-Train]   {new_data_dir / 'GT'}        (256x256 ground truth)\n"
+                f"[Auto-Train] Current model is up-to-date.",
+                flush=True,
+            )
         return
 
     print(f"\n[Auto-Train] Detected {len(new_pairs)} new training pair(s) in {new_data_dir}!", flush=True)
     print("[Auto-Train] Initiating fine-tuning & accuracy evaluation...", flush=True)
 
     class RetrainArgs:
-        data_root = str(DATA_ROOT)
-        new_data_dir = str(NEW_DATA_DIR)
+        data_root      = str(DATA_ROOT)
+        new_data_dir   = str(NEW_DATA_DIR)
         checkpoint_dir = str(CHECKPOINT_DIR)
         production_dir = str(PRODUCTION_DIR)
-        archive_dir = str(ARCHIVE_DIR)
-        history_csv = str(HISTORY_CSV)
+        archive_dir    = str(ARCHIVE_DIR)
+        history_csv    = str(HISTORY_CSV)
         retrain_epochs = 30
-        batch_size = 8
-        lr = 5e-5
-        weight_decay = 1e-4
-        ema_decay = 0.999
-        val_fraction = 0.1
-        seed = 42
-        num_workers = 2
-        width = 32
-        min_new_files = 1
-        dry_run = False
+        batch_size     = 8
+        lr             = 5e-5
+        weight_decay   = 1e-4
+        ema_decay      = 0.999
+        val_fraction   = 0.1
+        seed           = 42
+        num_workers    = 2
+        width          = 32
+        min_new_files  = 1
+        dry_run        = False
 
-    args = RetrainArgs()
-    retrain_cycle(args)
+    retrain_cycle(RetrainArgs())
 
 
 # =============================================================================
