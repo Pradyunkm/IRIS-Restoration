@@ -1,34 +1,25 @@
 """
 losses.py
 
-Differentiable loss terms for Experiments 2–6:
+Differentiable loss terms for Experiments 2–5:
 
     L = lambda_pixel * L_pixel + lambda_struct * L_struct
-      + lambda_edge * L_edge + lambda_freq * L_freq (Exp 6+)
+      + lambda_edge * L_edge + lambda_freq * L_freq (optional, disabled by default)
 
-New in Exp 6:
-- L_freq : L1 loss in the Fourier frequency domain (rfft2). Penalizes
-           errors in high-frequency content (edges, textures, fine detail)
-           that Charbonnier / SSIM losses tend to smooth away because they
-           operate purely in the spatial domain. Used in NAFNet, Restormer,
-           and recent SOTA denoisers. Weight: lambda_freq=0.05 (small but
-           complementary to the spatial terms).
+Loss components:
+- L_pixel  : Charbonnier loss — robust pixel-fidelity signal (outlier-tolerant
+             variant of L2). Used in all experiments.
+- L_struct : 1 - SSIM. Differentiable Gaussian-window SSIM. Penalises
+             structural dissimilarity even when pixel-level errors average out.
+- L_edge   : |Sobel(pred) - Sobel(gt)|, L1 on gradient-magnitude maps.
+             Directly penalises edge blur — an edge that gets smoothed away
+             costs loss here even if pixel values happen to average correctly.
+- L_freq   : L1 loss in the 2-D Fourier frequency domain (rfft2). Optional;
+             set lambda_freq=0.0 (default) to disable. Penalises errors in
+             high-frequency detail that spatial losses tend to smooth away.
 
-- L_pixel   : Charbonnier (same as the Phase 2 baseline -- keeps the basic
-              pixel-fidelity signal so this experiment is additive, not a
-              replacement).
-- L_struct  : 1 - SSIM. Differentiable Gaussian-window SSIM (same window
-              settings as the metric in train.py, but usable in backward()).
-- L_edge    : |Sobel(pred) - Sobel(gt)|, L1 on gradient-magnitude maps.
-              Directly penalizes the "regression to the mean" blur we saw
-              in the baseline's face/texture predictions -- an edge that
-              gets smoothed away costs loss here even if the pixel values
-              happen to average out close to correct.
-
-All three operate on already-clipped-to-[0,1] predictions is NOT assumed;
-clipping is left to the caller (train_exp2.py clips before computing loss,
-consistent with train.py's evaluation-time-only clipping policy -- see
-model.py docstring).
+Default weights for the final Exp 5 model:
+    lambda_pixel=1.0, lambda_struct=0.2, lambda_edge=0.3, lambda_freq=0.0
 """
 
 import torch
@@ -100,14 +91,11 @@ class EdgeLoss(nn.Module):
 
 class FFTLoss(nn.Module):
     """
-    L1 loss in the 2-D frequency domain (torch.fft.rfft2).
-
-    Penalizes errors in amplitude and phase of each frequency component,
-    which directly targets high-frequency detail that spatial losses miss.
-    This is the same loss used in NAFNet and Restormer.
-
-    Works on single-channel (B,1,H,W) tensors; generalises trivially
-    to multi-channel inputs.
+    Fourier frequency-domain L1 loss (rfft2).
+    Penalizes errors in high-frequency detail that spatial losses
+    (Charbonnier, SSIM) tend to smooth away.
+    This loss is commonly used in modern restoration architectures (e.g., Restormer).
+    Expects input & target in [0, 1] range, shape (B, 1, H, W).
     """
 
     def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
