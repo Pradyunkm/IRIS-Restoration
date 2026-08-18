@@ -1,0 +1,8 @@
+# Core deep learning framework (CUDA 12.1 build used during development)
+torch==2.5.1
+# numpy – array I/O and metric computation
+numpy==1.26.4
+# Image utilities – PNG preview export
+Pillow==11.3.0
+# Progress bar
+tqdm==4.67.1

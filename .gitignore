@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+venv/
+.venv/
+.vscode/
+*.npy
+*.zip
+.DS_Store
+__MACOSX/
+*.onnx
+outputs/*
+results/eval_test/
+results/eval_exp5_test/
