@@ -1,23 +1,20 @@
 """
 compute_clean_metrics.py
 
-Recomputes validation PSNR/SSIM for all three trained checkpoints
-(Experiment 1 baseline, Experiment 2 +loss, Experiment 3 +capacity),
-reporting BOTH:
-    - "official": full 320-sample val split, matching the numbers
-      already logged during training (25.76 / 25.63 / 26.62 dB)
+Recomputes validation PSNR/SSIM for all five trained checkpoints
+(Experiments 1–5), reporting BOTH:
+    - "official": full val split, matching training-time logged numbers
     - "clean": same val split with the known corrupted/noise-only
       samples excluded (file IDs 002637 and 002973 -- confirmed via
       inspect_outliers.py to have GT std=0.289, the signature of pure
-      uniform random noise rather than a real image; no model can
-      achieve meaningful PSNR against an unpredictable target)
+      uniform random noise; no model can achieve meaningful PSNR
+      against an unpredictable target)
 
-This gives an honest, defensible pair of numbers for the final report:
-the number as trained/logged, and the number with known-unsolvable
-samples removed.
+Experiment 5 (IRISConditioned + FiLM conditioning) is the final
+submitted model.  Exp 5 with 8-way TTA is also evaluated for reference.
 
 Usage:
-    python compute_clean_metrics.py --data_root "C:\\Users\\sekuh\\Desktop\\semicon\\train"
+    python compute_clean_metrics.py --data_root "C:\\path\\to\\dataset\\train\\train"
 """
 
 import argparse
@@ -30,7 +27,6 @@ from torch.utils.data import DataLoader
 from dataset import make_train_val_split
 from model import IRISBaseline, IRISStronger
 from model_conditioned import IRISConditioned
-from model_nafnet import NAFNetIRIS
 
 
 KNOWN_CORRUPTED_IDS = {"002637", "002973"}  # confirmed pure-noise GT, no learnable structure
@@ -144,13 +140,12 @@ def main():
     _, val_set = make_train_val_split(args.data_root, val_fraction=args.val_fraction, seed=args.seed)
 
     experiments = [
-        ("Experiment 1 (baseline)", "checkpoints/best.pt", "baseline", False),
-        ("Experiment 2 (+ struct/edge loss)", "checkpoints_exp2/best.pt", "baseline", False),
-        ("Experiment 3 (+ capacity)", "checkpoints_exp3/best.pt", "stronger", False),
-        ("Experiment 4 (+ synthetic augmentation)", "checkpoints_exp4/best.pt", "stronger", False),
-        ("Experiment 5 (+ degradation conditioning)", "checkpoints_exp5/best.pt", "conditioned", False),
-        ("Experiment 6 (+ NAFNet + FFT + EMA)", "checkpoints_exp6/best.pt", "nafnet", False),
-        ("Experiment 6 (+ NAFNet + FFT + EMA + 8-way TTA)", "checkpoints_exp6/best.pt", "nafnet", True),
+        ("Experiment 1 (baseline)",                     "checkpoints/best.pt",      "baseline",   False),
+        ("Experiment 2 (+ struct/edge loss)",            "checkpoints_exp2/best.pt", "baseline",   False),
+        ("Experiment 3 (+ capacity)",                   "checkpoints_exp3/best.pt", "stronger",   False),
+        ("Experiment 4 (+ synthetic augmentation)",      "checkpoints_exp4/best.pt", "stronger",   False),
+        ("Experiment 5 (+ degradation conditioning)",    "checkpoints_exp5/best.pt", "conditioned", False),
+        ("Experiment 5 + 8-way TTA (final submission)",  "checkpoints_exp5/best.pt", "conditioned", True),
     ]
 
     results = []
@@ -166,8 +161,6 @@ def main():
             model = IRISStronger(channels=112, num_res_blocks=16).to(device)
         elif model_type == "conditioned":
             model = IRISConditioned(channels=112, num_res_blocks=16, embed_dim=32).to(device)
-        elif model_type == "nafnet":
-            model = NAFNetIRIS(width=32, enc_blks=[1, 1, 1, 28], middle_blks=1, dec_blks=[1, 1, 1, 1]).to(device)
         else:
             model = IRISBaseline(channels=64, num_res_blocks=8).to(device)
         model.load_state_dict(checkpoint["model_state"])
