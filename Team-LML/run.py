@@ -2,7 +2,14 @@
 run.py  –  Team-LML  |  SEMICON Hackathon 2026 – KLA Problem Statement
 AI-Based Restoration of Degraded Images
 
-Model: Experiment 6 – NAFNetIRIS (UNet + SimpleGate + Channel Attention + FFT Loss + EMA + TTA)
+Model: Experiment 5 – IRISConditioned
+       Degradation-aware FiLM-conditioned ResNet with PixelShuffle 2× upsample
+
+Architecture:
+  - DegradationEncoder: small CNN that embeds the input's degradation characteristics
+  - FiLMResidualBlock: 16 residual blocks modulated by the degradation embedding
+  - PixelShuffle 2× upsample head + global residual (bilinear + learned correction)
+  - Parameters: ~4.66 M
 
 Usage:
     python run.py <input-dir> <output-dir>
@@ -30,153 +37,130 @@ from tqdm import tqdm
 #  Model architecture  (self-contained – no external module imports)
 # =============================================================================
 
-class SimpleGate(nn.Module):
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x1, x2 = x.chunk(2, dim=1)
-        return x1 * x2
-
-
-class ChannelAttention(nn.Module):
-    def __init__(self, channels: int, reduction: int = 4):
-        super().__init__()
-        mid = max(channels // reduction, 4)
-        self.pool = nn.AdaptiveAvgPool2d(1)
-        self.fc   = nn.Sequential(
-            nn.Conv2d(channels, mid, 1, bias=False),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(mid, channels, 1, bias=False),
-            nn.Sigmoid(),
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return x * self.fc(self.pool(x))
-
-
-class NAFBlock(nn.Module):
-    def __init__(self, channels: int, ffn_expand: int = 2):
-        super().__init__()
-        dw_channels = channels * ffn_expand
-
-        self.norm1 = nn.GroupNorm(1, channels)
-        self.conv1 = nn.Conv2d(channels, dw_channels * 2, 1)
-        self.conv2 = nn.Conv2d(dw_channels * 2, dw_channels * 2,
-                               kernel_size=3, padding=1, groups=dw_channels * 2)
-        self.conv3 = nn.Conv2d(dw_channels, channels, 1)
-        self.gate  = SimpleGate()
-        self.ca    = ChannelAttention(dw_channels)
-
-        self.norm2 = nn.GroupNorm(1, channels)
-        self.conv4 = nn.Conv2d(channels, channels * 2, 1)
-        self.conv5 = nn.Conv2d(channels, channels, 1)
-
-        self.beta  = nn.Parameter(torch.zeros(1, channels, 1, 1) + 1e-2)
-        self.gamma = nn.Parameter(torch.zeros(1, channels, 1, 1) + 1e-2)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        inp = x
-        x   = self.norm1(x)
-        x   = self.conv1(x)
-        x   = self.conv2(x)
-        x   = self.gate(x)
-        x   = self.ca(x)
-        x   = self.conv3(x)
-        y   = inp + x * self.beta
-
-        x      = self.norm2(y)
-        x      = self.conv4(x)
-        x1, x2 = x.chunk(2, dim=1)
-        x      = x1 * torch.sigmoid(x2)
-        x      = self.conv5(x)
-        return y + x * self.gamma
-
-
-class DownsampleBlock(nn.Module):
+class ResidualBlock(nn.Module):
+    """Standard residual block used in the post-upsample refinement stage."""
     def __init__(self, channels: int):
         super().__init__()
-        self.conv = nn.Conv2d(channels, channels * 2, kernel_size=2, stride=2)
+        self.conv1 = nn.Conv2d(channels, channels, kernel_size=3, padding=1)
+        self.conv2 = nn.Conv2d(channels, channels, kernel_size=3, padding=1)
+        self.relu = nn.ReLU(inplace=True)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.conv(x)
+        return x + self.conv2(self.relu(self.conv1(x)))
 
 
-class UpsampleBlock(nn.Module):
+class PixelShuffleUpsample(nn.Module):
+    """2× spatial upsample via PixelShuffle (no checkerboard artefacts)."""
     def __init__(self, channels: int):
         super().__init__()
-        self.conv    = nn.Conv2d(channels, channels // 2 * 4, 1)
+        self.conv = nn.Conv2d(channels, channels * 4, kernel_size=3, padding=1)
         self.shuffle = nn.PixelShuffle(2)
+        self.relu = nn.ReLU(inplace=True)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.shuffle(self.conv(x))
+        return self.relu(self.shuffle(self.conv(x)))
 
 
-class NAFNetIRIS(nn.Module):
-    def __init__(
-        self,
-        width: int = 32,
-        enc_blks: list = None,
-        middle_blks: int = 1,
-        dec_blks: list = None,
-    ):
+class DegradationEncoder(nn.Module):
+    """
+    Small CNN that encodes the degradation characteristics of the input.
+    Produces a compact embedding used by FiLM layers to adapt each block's
+    processing to the specific noise / blur profile of the current image.
+    """
+    def __init__(self, embed_dim: int = 32):
         super().__init__()
-        if enc_blks is None:
-            enc_blks = [1, 1, 1, 28]
-        if dec_blks is None:
-            dec_blks = [1, 1, 1, 1]
-
-        self.intro = nn.Conv2d(1, width, kernel_size=3, padding=1)
-
-        self.encoders = nn.ModuleList()
-        self.downs    = nn.ModuleList()
-        ch = width
-        for n in enc_blks:
-            self.encoders.append(nn.Sequential(*[NAFBlock(ch) for _ in range(n)]))
-            self.downs.append(DownsampleBlock(ch))
-            ch *= 2
-
-        self.middle = nn.Sequential(*[NAFBlock(ch) for _ in range(middle_blks)])
-
-        self.decoders = nn.ModuleList()
-        self.ups      = nn.ModuleList()
-        for n in dec_blks:
-            self.ups.append(UpsampleBlock(ch))
-            ch //= 2
-            self.decoders.append(nn.Sequential(*[NAFBlock(ch) for _ in range(n)]))
-
-        self.ending = nn.Conv2d(ch, width, kernel_size=3, padding=1)
-
-        self.upsample = nn.Sequential(
-            nn.Conv2d(width, width * 4, kernel_size=3, padding=1),
-            nn.PixelShuffle(2),
+        self.net = nn.Sequential(
+            nn.Conv2d(1, 16, kernel_size=3, stride=2, padding=1),   # 128 → 64
             nn.ReLU(inplace=True),
+            nn.Conv2d(16, 32, kernel_size=3, stride=2, padding=1),  # 64 → 32
+            nn.ReLU(inplace=True),
+            nn.Conv2d(32, 32, kernel_size=3, stride=2, padding=1),  # 32 → 16
+            nn.ReLU(inplace=True),
+            nn.AdaptiveAvgPool2d(1),
         )
+        self.fc = nn.Linear(32, embed_dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        feat = self.net(x).flatten(1)
+        return self.fc(feat)
+
+
+class FiLMResidualBlock(nn.Module):
+    """
+    Residual block with FiLM (Feature-wise Linear Modulation).
+    The degradation embedding is projected to per-channel scale (gamma)
+    and shift (beta): out = gamma * features + beta.
+    This lets the network adapt internally to each image's degradation.
+    """
+    def __init__(self, channels: int, embed_dim: int):
+        super().__init__()
+        self.conv1 = nn.Conv2d(channels, channels, kernel_size=3, padding=1)
+        self.conv2 = nn.Conv2d(channels, channels, kernel_size=3, padding=1)
+        self.relu = nn.ReLU(inplace=True)
+        self.film = nn.Linear(embed_dim, channels * 2)
+
+    def forward(self, x: torch.Tensor, embedding: torch.Tensor) -> torch.Tensor:
+        identity = x
+        out = self.relu(self.conv1(x))
+        out = self.conv2(out)
+
+        gamma_beta = self.film(embedding)
+        gamma, beta = gamma_beta.chunk(2, dim=1)
+        gamma = gamma.unsqueeze(-1).unsqueeze(-1)
+        beta = beta.unsqueeze(-1).unsqueeze(-1)
+
+        out = out * (1.0 + gamma) + beta
+        return identity + out
+
+
+class IRISConditioned(nn.Module):
+    """
+    Experiment 5: degradation-aware FiLM-conditioned restoration network.
+
+    Input : (B, 1, 128, 128) float32
+    Output: (B, 1, 256, 256) float32
+
+    Default config: channels=112, num_res_blocks=16, embed_dim=32 → ~4.66 M params
+    """
+    def __init__(self, channels: int = 112, num_res_blocks: int = 16, embed_dim: int = 32):
+        super().__init__()
+        self.degradation_encoder = DegradationEncoder(embed_dim=embed_dim)
+
+        self.stem = nn.Conv2d(1, channels, kernel_size=3, padding=1)
+        self.stem_relu = nn.ReLU(inplace=True)
+
+        self.res_blocks = nn.ModuleList(
+            [FiLMResidualBlock(channels, embed_dim) for _ in range(num_res_blocks)]
+        )
+
+        self.pre_upsample_conv = nn.Conv2d(channels, channels, kernel_size=3, padding=1)
+        self.upsample = PixelShuffleUpsample(channels)
+        self.post_upsample_block = ResidualBlock(channels)
 
         self.refine = nn.Sequential(
-            nn.Conv2d(width, width, kernel_size=3, padding=1),
+            nn.Conv2d(channels, channels, kernel_size=3, padding=1),
             nn.ReLU(inplace=True),
-            nn.Conv2d(width, 1, kernel_size=3, padding=1),
+            nn.Conv2d(channels, 1, kernel_size=3, padding=1),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        skip = F.interpolate(x, scale_factor=2, mode="bilinear", align_corners=False)
+        naive_upsample = F.interpolate(x, scale_factor=2, mode="bilinear", align_corners=False)
 
-        feat = self.intro(x)
+        embedding = self.degradation_encoder(x)
 
-        enc_features = []
-        for encoder, down in zip(self.encoders, self.downs):
-            feat = encoder(feat)
-            enc_features.append(feat)
-            feat = down(feat)
+        feat = self.stem_relu(self.stem(x))
+        for block in self.res_blocks:
+            feat = block(feat, embedding)
 
-        feat = self.middle(feat)
-
-        for decoder, up, enc_feat in zip(self.decoders, self.ups, reversed(enc_features)):
-            feat = up(feat)
-            feat = feat + enc_feat
-            feat = decoder(feat)
-
-        feat = self.ending(feat)
+        feat = self.pre_upsample_conv(feat)
         feat = self.upsample(feat)
-        return skip + self.refine(feat)
+        feat = self.post_upsample_block(feat)
+
+        correction = self.refine(feat)
+        return naive_upsample + correction
+
+    def count_parameters(self) -> int:
+        return sum(p.numel() for p in self.parameters() if p.requires_grad)
 
 
 # =============================================================================
@@ -223,10 +207,21 @@ def load_model(checkpoint_path: Path, device: torch.device) -> nn.Module:
     ckpt  = torch.load(checkpoint_path, map_location=device, weights_only=False)
     state = ckpt["model_state"] if "model_state" in ckpt else ckpt
 
-    model = NAFNetIRIS(width=32, enc_blks=[1, 1, 1, 28], middle_blks=1, dec_blks=[1, 1, 1, 1]).to(device)
+    # Read architecture args saved in checkpoint, fall back to defaults
+    saved_args    = ckpt.get("args", {}) if isinstance(ckpt, dict) else {}
+    channels      = saved_args.get("channels", 112)
+    num_res_blocks = saved_args.get("num_res_blocks", 16)
+    embed_dim     = saved_args.get("embed_dim", 32)
+
+    model = IRISConditioned(
+        channels=channels,
+        num_res_blocks=num_res_blocks,
+        embed_dim=embed_dim,
+    ).to(device)
     model.load_state_dict(state)
     model.eval()
-    print(f"[Team-LML] Loaded checkpoint: {checkpoint_path}", flush=True)
+    print(f"[Team-LML] Loaded checkpoint: {checkpoint_path} "
+          f"(channels={channels}, blocks={num_res_blocks})", flush=True)
     return model
 
 
@@ -249,8 +244,8 @@ def trigger_auto_retrain_if_new_data_present(verbose: bool = True):
     evaluate on validation set, and replace models/best.pt if accuracy improves.
 
     Drop new training pairs into:
-      new_data/NoisyLR/NNNNNN.npy  (128x128 float32)
-      new_data/GT/NNNNNN.npy       (256x256 float32)
+      new_data/NoisyLR/NNNNNN.npy  (128×128 float32)
+      new_data/GT/NNNNNN.npy       (256×256 float32)
     before running run.py, and the model will be automatically fine-tuned.
     """
     root_dir = Path(__file__).resolve().parent.parent
@@ -280,8 +275,8 @@ def trigger_auto_retrain_if_new_data_present(verbose: bool = True):
             print(
                 f"[Auto-Train] No new paired data found in {new_data_dir}.\n"
                 f"[Auto-Train] To trigger retraining, drop matching .npy files into:\n"
-                f"[Auto-Train]   {new_data_dir / 'NoisyLR'}  (128x128 inputs)\n"
-                f"[Auto-Train]   {new_data_dir / 'GT'}        (256x256 ground truth)\n"
+                f"[Auto-Train]   {new_data_dir / 'NoisyLR'}  (128×128 inputs)\n"
+                f"[Auto-Train]   {new_data_dir / 'GT'}        (256×256 ground truth)\n"
                 f"[Auto-Train] Current model is up-to-date.",
                 flush=True,
             )
@@ -300,12 +295,12 @@ def trigger_auto_retrain_if_new_data_present(verbose: bool = True):
         retrain_epochs = 30
         batch_size     = 8
         lr             = 5e-5
-        weight_decay   = 1e-4
-        ema_decay      = 0.999
         val_fraction   = 0.1
         seed           = 42
         num_workers    = 2
-        width          = 32
+        channels       = 112
+        num_res_blocks = 16
+        embed_dim      = 32
         min_new_files  = 1
         dry_run        = False
 
@@ -344,8 +339,8 @@ def main():
     model_path = script_dir / "models" / "best.pt"
 
     if not model_path.exists():
-        # Fallback to checkpoints_exp6 if not yet copied to models/
-        fallback = script_dir.parent / "checkpoints_exp6" / "best.pt"
+        # Fallback to checkpoints_exp5 if not yet copied to models/
+        fallback = script_dir.parent / "checkpoints_exp5" / "best.pt"
         if fallback.exists():
             model_path = fallback
         else:

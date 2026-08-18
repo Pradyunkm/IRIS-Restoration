@@ -10,9 +10,9 @@
 
 <p align="center">
   <img src="https://img.shields.io/badge/Task-Image%20Restoration%20%26%20Super--Resolution-blueviolet?style=for-the-badge" alt="Task Badge"/>
-  <img src="https://img.shields.io/badge/Architecture-NAFNet%20UNet-informational?style=for-the-badge" alt="Architecture Badge"/>
+  <img src="https://img.shields.io/badge/Architecture-FiLM%20Conditioned%20ResNet-informational?style=for-the-badge" alt="Architecture Badge"/>
   <img src="https://img.shields.io/badge/Framework-PyTorch-EE4C2C?style=for-the-badge&logo=pytorch&logoColor=white" alt="PyTorch"/>
-  <img src="https://img.shields.io/badge/Best%20Val%20PSNR-26.56%20dB-success?style=for-the-badge" alt="PSNR Badge"/>
+  <img src="https://img.shields.io/badge/Best%20Val%20PSNR-29.07%20dB-success?style=for-the-badge" alt="PSNR Badge"/>
 </p>
 
 <p align="center">
@@ -40,7 +40,7 @@
 
 IRIS (Image Restoration for Inspection Systems) solves a **joint denoising + 2× super-resolution** problem on real semiconductor wafer inspection images. Each input is a `128×128` float32 `.npy` array (noisy, low-resolution scan). The goal is to recover a `256×256` float32 output with maximum structural fidelity, measured by PSNR and SSIM.
 
-The solution went through **six iterative experiments**, starting from a compact CNN baseline and ending with a full **NAFNet UNet** backbone enhanced with FFT frequency-domain loss, EMA weight averaging, and geometric augmentation.
+The solution went through **five iterative experiments**, starting from a compact CNN baseline and culminating in a **FiLM-conditioned ResNet** (Experiment 5) — the final submission model.
 
 ---
 
@@ -51,12 +51,11 @@ The competition-ready submission lives in `Team-LML/`:
 ```
 Team-LML/
 ├── run.py              # Standalone inference entry point (self-contained, offline)
-├── run_exp6.py         # Alternative Exp6-specific inference runner
 ├── auto_retrain.py     # Continuous auto-retraining & model hot-swap runner
 ├── requirements.txt    # Pinned Python dependencies
 ├── README.md           # Submission-specific documentation
 └── models/
-    └── best.pt         # Trained NAFNet weights (EMA, ~100 MB, Git LFS)
+    └── best.pt         # Trained IRISConditioned weights (~18 MB, Git LFS)
 ```
 
 ---
@@ -97,7 +96,8 @@ python Team-LML/run.py dataset/Test_NoisyLR/ results/output/
 | **Fully offline** | No internet, API keys, or manual configuration required |
 | **Auto-retrain** | Checks `new_data/` for fresh labeled pairs and fine-tunes before returning |
 
-> Skip auto-retraining: `python Team-LML/run.py <in> <out> --no_auto_train`
+> Skip auto-retraining: `python Team-LML/run.py <in> <out> --no_auto_train`  
+> Skip TTA (faster): `python Team-LML/run.py <in> <out> --no_tta`
 
 ---
 
@@ -110,8 +110,8 @@ flowchart TD
     A["🔍 Watch new_data/ folder"] --> B{"New paired\nNoisyLR + GT\nfiles detected?"}
     B -- No --> A
     B -- Yes --> C["Ingest pairs → dataset/train/train/"]
-    C --> D["Fine-tune NAFNet model\n(from current best.pt)"]
-    D --> E["Evaluate on validation split\nCompute EMA-PSNR & SSIM"]
+    C --> D["Fine-tune IRISConditioned model\n(from current best.pt)"]
+    D --> E["Evaluate on validation split\nCompute PSNR & SSIM"]
     E --> F{"New PSNR >\ncurrent best PSNR?"}
     F -- Yes --> G["✅ Replace Team-LML/models/best.pt\nArchive old checkpoint"]
     F -- No --> H["❌ Keep current best\nLog: new model was worse"]
@@ -152,47 +152,46 @@ Each experiment stacks one new contribution on top of the previous winner:
 | **Exp 2** | Compact CNN | + Structural (SSIM) & Sobel Edge loss | 813 K | 28.26 dB | 0.7753 |
 | **Exp 3** | Deep ResNet | 16 ResBlocks + PixelShuffle 2× | 4.52 M | 29.05 dB | 0.7946 |
 | **Exp 4** | Deep ResNet | + Order-agnostic degradation simulator | 4.52 M | 29.06 dB | 0.7946 |
-| **Exp 5** | Conditioned ResNet | Degradation encoder + FiLM modulation | 4.66 M | 29.07 dB | 0.7964 |
-| **Exp 6 ✅** | **NAFNet UNet** | **SimpleGate + CA + FFT Loss + EMA + TTA** | **~17 M** | **26.56 dB** | **0.7957** |
+| **Exp 5 ✅** | **FiLM Conditioned ResNet** | **Degradation encoder + FiLM modulation** | **4.66 M** | **29.07 dB** | **0.7964** |
 
-> **Note:** Exp 6 EMA-PSNR is measured on the held-out 10% validation split with 8-way TTA at inference, which may differ from the raw per-epoch val metric logged during training.
+> Exp 5 is the **best and final model** — highest PSNR and SSIM across all experiments with an efficient 4.66 M parameter footprint.
 
 ---
 
 ## 🏗️ Architecture Deep-Dive
 
-### NAFNet UNet (`model_nafnet.py`)
+### IRISConditioned (`model_conditioned.py`) — Experiment 5
 
-Based on *"Simple Baselines for Image Restoration"* (Chen et al., ECCV 2022).
+The model combines a **degradation-aware encoder** with a **FiLM-modulated ResNet** backbone and a **PixelShuffle 2× upsample head**.
 
 ```
 Input  (B, 1, 128, 128)
        │
-  ┌────▼────┐
-  │  Intro  │  3×3 Conv → width channels
-  └────┬────┘
-       │
-  ┌────▼──────────────────────────────────┐
-  │  UNet Encoder (4 scales)              │
-  │  enc_blks = [1, 1, 1, 28]            │
-  │  NAFBlock × n  →  stride-2 DownConv  │
-  │  Channels: 32 → 64 → 128 → 256       │
-  └────┬──────────────────────────────────┘
-       │
-  ┌────▼────┐
-  │Bottleneck│ 1 NAFBlock at 8×8
-  └────┬────┘
-       │
-  ┌────▼────────────────────────────────────────┐
-  │ UNet Decoder (4 scales)                      │
-  │ PixelShuffle ×2 + additive skip + NAFBlock   │
-  │ Channels: 256 → 128 → 64 → 32               │
-  └────┬────────────────────────────────────────┘
-       │
-  ┌────▼───────┐
-  │Output head │  3×3 Conv → PixelShuffle 2× → ReLU → 3×3 → 1
-  └────┬───────┘
-       │          +  bilinear upsample of raw input (global residual)
+       ├──────────────────────────────────────────────┐
+       │                                              │
+  ┌────▼─────────────┐                         ┌─────▼──────┐
+  │ DegradationEncoder│                         │  Bilinear  │
+  │  Conv×3 + GAP     │                         │  2× Upsamp │
+  │  → embed (B, 32)  │                         └─────┬──────┘
+  └────┬─────────────┘                                │  (global residual)
+       │ embedding                                    │
+  ┌────▼─────────────────────────────────────┐        │
+  │  Stem Conv → 16 × FiLMResidualBlock      │        │
+  │  Each block: Conv×2 + FiLM(γ,β) + skip  │        │
+  │  Channels: 112                           │        │
+  └────┬─────────────────────────────────────┘        │
+       │                                              │
+  ┌────▼──────────────────┐                           │
+  │  Pre-upsample Conv    │                           │
+  │  PixelShuffle 2×      │  128×128 → 256×256        │
+  │  Post-upsample ResBlk │                           │
+  └────┬──────────────────┘                           │
+       │                                              │
+  ┌────▼───────────────┐                              │
+  │  Refine head        │  Conv → ReLU → Conv(→1ch)  │
+  └────┬───────────────┘                              │
+       │ correction                                   │
+       └──────────────────  +  ───────────────────────┘
   Output (B, 1, 256, 256)
 ```
 
@@ -200,27 +199,29 @@ Input  (B, 1, 128, 128)
 
 | Block | Purpose |
 |---|---|
-| **SimpleGate** | Splits channels in half, multiplies element-wise — no saturation, no dead neurons |
-| **ChannelAttention** | Squeeze-and-Excitation via GAP + 1×1 Conv — recalibrates feature importance |
-| **NAFBlock** | DWConv branch (SimpleGate + CA) + FFN branch (SiLU gating) + learnable β/γ scales |
-| **DownsampleBlock** | Strided 2×2 Conv for spatial resolution halving |
-| **UpsampleBlock** | PixelShuffle 2× for checkerboard-free upsampling |
-| **EMA** | Exponential Moving Average (decay=0.999) — ~+0.3 dB PSNR at zero extra inference cost |
+| **DegradationEncoder** | 3-layer CNN + GAP + Linear → 32-dim embedding encoding the input's noise/blur profile |
+| **FiLMResidualBlock** | Standard ResBlock whose features are modulated by per-channel scale (γ) and shift (β) derived from the degradation embedding |
+| **PixelShuffleUpsample** | Checkerboard-free 2× spatial upsampling via PixelShuffle |
+| **ResidualBlock** | Standard post-upsample refinement block |
+| **Global Residual** | Bilinear 2× upsample of raw input added to the learned correction — ensures smooth baseline output |
+
+#### Why FiLM Conditioning Works
+
+Traditional restoration networks apply the same processing to every image regardless of degradation severity. FiLM lets the network **adapt its residual block behaviour** based on what the `DegradationEncoder` detects from the specific input. This is the key gain over Exp 3/4 — the network learns different internal processing strategies for differently-degraded inputs.
 
 ---
 
 ## 📐 Loss Functions
 
-All experiments use a combination of spatial and frequency-domain losses (`losses.py`):
+Experiments 2–5 use a combination of spatial losses (`losses.py`):
 
-$$L = \lambda_{\text{pixel}} \cdot L_{\text{Charb}} + \lambda_{\text{struct}} \cdot L_{\text{SSIM}} + \lambda_{\text{edge}} \cdot L_{\text{Edge}} + \lambda_{\text{freq}} \cdot L_{\text{FFT}}$$
+$$L = \lambda_{\text{pixel}} \cdot L_{\text{Charb}} + \lambda_{\text{struct}} \cdot L_{\text{SSIM}} + \lambda_{\text{edge}} \cdot L_{\text{Edge}}$$
 
-| Term | Formula | Weight (Exp 6) | Purpose |
+| Term | Formula | Weight (Exp 5) | Purpose |
 |---|---|---|---|
 | **Charbonnier** | $\sqrt{(p-t)^2 + \varepsilon^2}$ | 1.0 | Robust pixel fidelity (outlier-tolerant MSE) |
-| **SSIM** | $1 - \text{SSIM}(p, t)$ | 0.15 | Structural / perceptual similarity |
-| **Edge (Sobel)** | $\|\nabla p - \nabla t\|_1$ | 0.20 | Penalises edge blur directly |
-| **FFT** | $\|Re(\hat{p}-\hat{t})\|_1 + \|Im(\hat{p}-\hat{t})\|_1$ | 0.05 | High-frequency detail recovery |
+| **SSIM** | $1 - \text{SSIM}(p, t)$ | 0.2 | Structural / perceptual similarity |
+| **Edge (Sobel)** | $\|\nabla p - \nabla t\|_1$ | 0.3 | Penalises edge blur directly |
 
 ---
 
@@ -255,14 +256,14 @@ pip install -r Team-LML/requirements.txt
 ### Training from Scratch
 
 ```bash
-# Experiment 6 — NAFNet + FFT Loss + EMA (recommended)
-python scripts/train_exp6.py \
+# Experiment 5 — FiLM-conditioned ResNet (best model)
+python scripts/train_exp5.py \
     --data_root dataset/train/train \
-    --epochs 200 \
+    --epochs 100 \
     --batch_size 8
 
 # Quick smoke-test (5 epochs)
-python scripts/train_exp6.py \
+python scripts/train_exp5.py \
     --data_root dataset/train/train \
     --epochs 5 \
     --batch_size 8
@@ -270,14 +271,14 @@ python scripts/train_exp6.py \
 
 | Argument | Default | Description |
 |---|---|---|
-| `--data_root` | `dataset/train/train` | Folder with `NoisyLR/` and `GT/` subfolders |
-| `--epochs` | 200 | Training epochs |
+| `--data_root` | *(required)* | Folder with `NoisyLR/` and `GT/` subfolders |
+| `--epochs` | 100 | Training epochs |
 | `--batch_size` | 8 | Batch size |
-| `--lr` | 2e-4 | AdamW learning rate |
-| `--warmup_epochs` | 5 | Linear warmup duration |
-| `--ema_decay` | 0.999 | EMA decay factor |
-| `--checkpoint_dir` | `checkpoints_exp6` | Where to save `.pt` and `log.csv` |
-| `--width` | 32 | NAFNet base channel count (~17 M params) |
+| `--lr` | 1e-4 | Adam learning rate |
+| `--channels` | 112 | ResNet base channel count |
+| `--num_res_blocks` | 16 | Number of FiLM residual blocks |
+| `--embed_dim` | 32 | Degradation embedding dimension |
+| `--checkpoint_dir` | `checkpoints_exp5` | Where to save `.pt` and `log.csv` |
 
 ---
 
@@ -288,24 +289,21 @@ IRIS-Restoration/
 │
 ├── Team-LML/                       # 🏆 Official hackathon submission bundle
 │   ├── run.py                      # Main inference entry point
-│   ├── run_exp6.py                 # Exp6-specific inference runner
 │   ├── auto_retrain.py             # Auto-retrain runner for submission
 │   ├── requirements.txt            # Pinned runtime dependencies
 │   ├── README.md                   # Submission documentation
 │   └── models/
-│       └── best.pt                 # Trained EMA weights (Git LFS, ~100 MB)
+│       └── best.pt                 # Trained IRISConditioned weights (Git LFS, ~18 MB)
 │
 ├── scripts/                        # Research & training code
-│   ├── model_nafnet.py             # NAFNet UNet architecture (Exp 6)
-│   ├── model_conditioned.py        # FiLM-conditioned ResNet (Exp 5)
+│   ├── model_conditioned.py        # IRISConditioned: FiLM-modulated ResNet (Exp 5) ✅
 │   ├── model.py                    # Compact CNN baseline (Exp 1–2)
-│   ├── train_exp6.py               # Exp 6 training (NAFNet + FFT + EMA)
 │   ├── train_exp5.py               # Exp 5 training (FiLM conditioning)
 │   ├── train_exp4.py               # Exp 4 training (degradation sim)
 │   ├── train_exp3.py               # Exp 3 training (deep ResNet)
 │   ├── train_exp2.py               # Exp 2 training (loss ablation)
 │   ├── train.py                    # Exp 1 baseline training
-│   ├── losses.py                   # Charbonnier + SSIM + Edge + FFT losses
+│   ├── losses.py                   # Charbonnier + SSIM + Edge losses
 │   ├── dataset.py                  # Paired dataset loader + val split
 │   ├── augmented_dataset.py        # Geometric augmentation wrapper
 │   ├── degradation_simulator.py    # Synthetic degradation augmentation
@@ -318,17 +316,15 @@ IRIS-Restoration/
 │   ├── visualize_pairs.py          # Side-by-side pair visualization
 │   └── visualize_predictions.py   # Prediction visualization
 │
-├── checkpoints_exp6/               # Experiment 6 checkpoints (Git LFS)
-│   ├── best.pt                     # Best EMA checkpoint
+├── checkpoints_exp5/               # Experiment 5 checkpoints (Git LFS) ✅ Best
+│   ├── best.pt                     # Best checkpoint
 │   ├── last.pt                     # Latest epoch checkpoint
-│   ├── log.csv                     # Per-epoch train/val metrics
-│   └── retrain_history.csv         # Auto-retrain cycle log
+│   └── log.csv                     # Per-epoch train/val metrics
 │
 ├── checkpoints/                    # Exp 1 checkpoints
 ├── checkpoints_exp2/               # Exp 2 checkpoints
 ├── checkpoints_exp3/               # Exp 3 checkpoints
 ├── checkpoints_exp4/               # Exp 4 checkpoints
-├── checkpoints_exp5/               # Exp 5 checkpoints
 │
 ├── dataset/                        # Training & test data (not tracked by git)
 │   └── train/train/
@@ -359,7 +355,7 @@ A: The trigger checks `new_data/NoisyLR/` and `new_data/GT/` for matched `.npy` 
 A: Ensure `scripts/auto_retrain.py` is present and `torch`, `numpy`, and `tqdm` are installed (`pip install -r Team-LML/requirements.txt`). Pass `--no_auto_train` to skip.
 
 **Q: CUDA out of memory during training.**  
-A: Reduce `--batch_size` to 4. Alternatively, lower `--width` to 16 for a ~4× smaller model (~4 M params) at some cost to quality.
+A: Reduce `--batch_size` to 4, or lower `--channels` to 64 and `--num_res_blocks` to 8 for a smaller model (~1 M params) at some cost to quality.
 
 **Q: Git LFS — weights not downloading.**  
 A: Run `git lfs install` before cloning, or fetch them manually: `git lfs pull`.

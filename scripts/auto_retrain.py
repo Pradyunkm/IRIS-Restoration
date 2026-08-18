@@ -1,13 +1,13 @@
 """
 auto_retrain.py
 
-Automated retraining pipeline for the IRIS NAFNet restoration model.
+Automated retraining pipeline for the IRIS IRISConditioned restoration model.
 
 This script:
   1. Watches a staging folder (new_data/) for new paired NoisyLR + GT files.
   2. Moves matched pairs into the training dataset.
-  3. Fine-tunes the NAFNet model from the current best checkpoint.
-  4. Evaluates the new model (EMA weights) on the validation set.
+  3. Fine-tunes the IRISConditioned model from the current best checkpoint.
+  4. Evaluates the new model on the validation set.
   5. Replaces the production model ONLY if the new model has higher PSNR.
   6. Archives old models and logs every cycle to retrain_history.csv.
 
@@ -27,22 +27,21 @@ Usage:
 
 import argparse
 import csv
-import os
 import random
 import shutil
 import time
-from copy import deepcopy
 from datetime import datetime
 from pathlib import Path
 
 import numpy as np
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from dataset import IRISPairedDataset, make_train_val_split
-from model_nafnet import NAFNetIRIS
+from model_conditioned import IRISConditioned
 from losses import CombinedLoss
 
 
@@ -53,7 +52,7 @@ from losses import CombinedLoss
 PROJECT_ROOT   = Path(__file__).resolve().parent.parent
 DATA_ROOT      = PROJECT_ROOT / "dataset" / "train" / "train"
 NEW_DATA_DIR   = PROJECT_ROOT / "new_data"
-CHECKPOINT_DIR = PROJECT_ROOT / "checkpoints_exp6"
+CHECKPOINT_DIR = PROJECT_ROOT / "checkpoints_exp5"
 ARCHIVE_DIR    = CHECKPOINT_DIR / "archive"
 PRODUCTION_DIR = PROJECT_ROOT / "Team-LML" / "models"
 HISTORY_CSV    = CHECKPOINT_DIR / "retrain_history.csv"
@@ -68,70 +67,6 @@ def set_seed(seed: int):
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
-
-
-# =============================================================================
-#  Geometric augmentation wrapper (same as train_exp6.py)
-# =============================================================================
-
-class AugmentedPairedDataset(Dataset):
-    """Wraps IRISPairedDataset with random flips + rotations."""
-
-    def __init__(self, base_dataset):
-        self.base_dataset = base_dataset
-
-    def __len__(self):
-        return len(self.base_dataset)
-
-    def __getitem__(self, idx):
-        sample = self.base_dataset[idx]
-        noisy  = sample["noisy"]
-        gt     = sample["gt"]
-
-        hflip = random.random() < 0.5
-        vflip = random.random() < 0.5
-        k_rot = random.randint(0, 3)
-
-        if hflip:
-            noisy = torch.flip(noisy, dims=[2])
-            gt    = torch.flip(gt,    dims=[2])
-        if vflip:
-            noisy = torch.flip(noisy, dims=[1])
-            gt    = torch.flip(gt,    dims=[1])
-        if k_rot > 0:
-            noisy = torch.rot90(noisy, k=k_rot, dims=[1, 2])
-            gt    = torch.rot90(gt,    k=k_rot, dims=[1, 2])
-
-        return {"noisy": noisy, "gt": gt, "file_id": sample["file_id"]}
-
-
-# =============================================================================
-#  EMA helper (same as train_exp6.py)
-# =============================================================================
-
-class EMA:
-    """Exponential Moving Average of model parameters."""
-
-    def __init__(self, model: torch.nn.Module, decay: float = 0.999):
-        self.model  = model
-        self.decay  = decay
-        self.shadow = deepcopy(model.state_dict())
-        self.backup = {}
-
-    @torch.no_grad()
-    def update(self):
-        for name, param in self.model.named_parameters():
-            if param.requires_grad:
-                new_avg = (1.0 - self.decay) * param.data + self.decay * self.shadow[name]
-                self.shadow[name] = new_avg.clone()
-
-    def apply_shadow(self):
-        self.backup = deepcopy(self.model.state_dict())
-        self.model.load_state_dict(self.shadow)
-
-    def restore(self):
-        self.model.load_state_dict(self.backup)
-        self.backup = {}
 
 
 # =============================================================================
@@ -174,7 +109,7 @@ def compute_ssim(pred: torch.Tensor, target: torch.Tensor) -> float:
 #  Training / validation loop
 # =============================================================================
 
-def run_epoch(model, loader, loss_fn, optimizer, device, train: bool, ema=None):
+def run_epoch(model, loader, loss_fn, optimizer, device, train: bool):
     model.train() if train else model.eval()
     total_loss = 0.0
     total_psnr = 0.0
@@ -197,8 +132,6 @@ def run_epoch(model, loader, loss_fn, optimizer, device, train: bool, ema=None):
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 optimizer.step()
-                if ema is not None:
-                    ema.update()
 
             total_loss += loss.item()
             total_psnr += compute_psnr(pred.detach(), gt)
@@ -210,19 +143,6 @@ def run_epoch(model, loader, loss_fn, optimizer, device, train: bool, ema=None):
         "psnr": total_psnr / max(n_batches, 1),
         "ssim": total_ssim / max(n_batches, 1),
     }
-
-
-# =============================================================================
-#  LR schedule: linear warmup + cosine annealing
-# =============================================================================
-
-def get_scheduler(optimizer, warmup_epochs: int, total_epochs: int):
-    def lr_lambda(epoch):
-        if epoch < warmup_epochs:
-            return (epoch + 1) / warmup_epochs
-        progress = (epoch - warmup_epochs) / max(1, total_epochs - warmup_epochs)
-        return 0.5 * (1.0 + np.cos(np.pi * progress))
-    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
 
 # =============================================================================
@@ -263,12 +183,10 @@ def ingest_new_data(new_data_dir: Path, data_root: Path, file_stems: list) -> in
         noisy_dst = dst_noisy / f"{stem}.npy"
         gt_dst    = dst_gt / f"{stem}.npy"
 
-        # Skip if file already exists in training set (avoid duplicates)
         if noisy_dst.exists() or gt_dst.exists():
             print(f"  [SKIP] {stem}.npy already exists in training set")
             continue
 
-        # Validate shapes before ingesting
         try:
             noisy_arr = np.load(noisy_src)
             gt_arr    = np.load(gt_src)
@@ -282,7 +200,6 @@ def ingest_new_data(new_data_dir: Path, data_root: Path, file_stems: list) -> in
             print(f"  [SKIP] {stem}.npy failed validation: {e}")
             continue
 
-        # Move files into training dataset
         shutil.move(str(noisy_src), str(noisy_dst))
         shutil.move(str(gt_src),    str(gt_dst))
         ingested += 1
@@ -308,18 +225,19 @@ def load_best_checkpoint(checkpoint_dir: Path, device: torch.device):
     saved_args = ckpt.get("args", {})
     best_psnr  = ckpt.get("val_psnr", -float("inf"))
 
-    width       = saved_args.get("width", 32)
-    middle_blks = saved_args.get("middle_blks", 1)
+    channels       = saved_args.get("channels", 112)
+    num_res_blocks = saved_args.get("num_res_blocks", 16)
+    embed_dim      = saved_args.get("embed_dim", 32)
 
-    model = NAFNetIRIS(
-        width=width,
-        enc_blks=[1, 1, 1, 28],
-        middle_blks=middle_blks,
-        dec_blks=[1, 1, 1, 1],
+    model = IRISConditioned(
+        channels=channels,
+        num_res_blocks=num_res_blocks,
+        embed_dim=embed_dim,
     ).to(device)
 
     model.load_state_dict(ckpt["model_state"])
-    print(f"  Loaded best.pt (PSNR: {best_psnr:.2f} dB, width={width})")
+    print(f"  Loaded best.pt (PSNR: {best_psnr:.2f} dB, "
+          f"channels={channels}, blocks={num_res_blocks})")
     return model, best_psnr, saved_args
 
 
@@ -337,22 +255,18 @@ def archive_and_swap(
     epoch: int,
     saved_args: dict,
 ):
-    """
-    Archive old best.pt and save new model as best.pt + production copy.
-    """
+    """Archive old best.pt and save new model as best.pt + production copy."""
     archive_dir.mkdir(parents=True, exist_ok=True)
     production_dir.mkdir(parents=True, exist_ok=True)
 
     best_path = checkpoint_dir / "best.pt"
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-    # Archive old best.pt
     if best_path.exists():
         archive_path = archive_dir / f"best_{timestamp}.pt"
         shutil.copy2(str(best_path), str(archive_path))
         print(f"  Archived old model -> {archive_path.name}")
 
-    # Save new best.pt
     torch.save(
         {
             "epoch": epoch,
@@ -366,7 +280,6 @@ def archive_and_swap(
     )
     print(f"  Saved new best.pt (PSNR: {new_psnr:.2f} dB)")
 
-    # Copy to production path
     prod_path = production_dir / "best.pt"
     shutil.copy2(str(best_path), str(prod_path))
     print(f"  Copied to production -> {prod_path}")
@@ -413,7 +326,7 @@ def retrain_cycle(args) -> bool:
     Run one retrain cycle:
       1. Check for new data
       2. Ingest it
-      3. Fine-tune
+      3. Fine-tune IRISConditioned
       4. Evaluate
       5. Hot-swap if better
 
@@ -458,25 +371,27 @@ def retrain_cycle(args) -> bool:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"  Device: {device}")
 
-    # Load current best model
     model, old_psnr, saved_args = load_best_checkpoint(checkpoint_dir, device)
 
     if model is None:
-        # No existing checkpoint — build fresh model
-        model = NAFNetIRIS(
-            width=args.width,
-            enc_blks=[1, 1, 1, 28],
-            middle_blks=1,
-            dec_blks=[1, 1, 1, 1],
+        channels       = getattr(args, "channels", 112)
+        num_res_blocks = getattr(args, "num_res_blocks", 16)
+        embed_dim      = getattr(args, "embed_dim", 32)
+        model = IRISConditioned(
+            channels=channels,
+            num_res_blocks=num_res_blocks,
+            embed_dim=embed_dim,
         ).to(device)
-        saved_args = {"width": args.width, "middle_blks": 1}
+        saved_args = {
+            "channels": channels,
+            "num_res_blocks": num_res_blocks,
+            "embed_dim": embed_dim,
+        }
 
-    # Build dataset with ALL data (old + new)
     train_base, val_set = make_train_val_split(
         str(data_root), val_fraction=args.val_fraction, seed=args.seed
     )
-    train_set = AugmentedPairedDataset(train_base)
-    total_train_size = len(train_set)
+    total_train_size = len(train_base)
     print(f"  Total training pairs: {total_train_size}")
     print(f"  Validation pairs: {len(val_set)}")
 
@@ -491,7 +406,7 @@ def retrain_cycle(args) -> bool:
         return True
 
     train_loader = DataLoader(
-        train_set, batch_size=args.batch_size, shuffle=True,
+        train_base, batch_size=args.batch_size, shuffle=True,
         num_workers=args.num_workers, drop_last=True, pin_memory=True,
     )
     val_loader = DataLoader(
@@ -500,35 +415,31 @@ def retrain_cycle(args) -> bool:
     )
 
     # --- Step 4: Fine-tune ---
-    ema = EMA(model, decay=args.ema_decay)
     loss_fn = CombinedLoss(
-        lambda_pixel=1.0, lambda_struct=0.15,
-        lambda_edge=0.2, lambda_freq=0.05,
+        lambda_pixel=1.0, lambda_struct=0.2,
+        lambda_edge=0.3, lambda_freq=0.0,
     ).to(device)
 
-    optimizer = torch.optim.AdamW(
-        model.parameters(), lr=args.lr, weight_decay=args.weight_decay
+    optimizer = torch.optim.Adam(
+        model.parameters(), lr=args.lr
     )
-    scheduler = get_scheduler(optimizer, warmup_epochs=2, total_epochs=args.retrain_epochs)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=args.retrain_epochs
+    )
 
     print(f"\n  Fine-tuning for {args.retrain_epochs} epochs (lr={args.lr}) ...")
     t0 = time.time()
 
-    best_retrain_psnr = -float("inf")
-    best_retrain_ssim = 0.0
+    best_retrain_psnr  = -float("inf")
+    best_retrain_ssim  = 0.0
     best_retrain_state = None
     best_retrain_epoch = 0
 
     for epoch in range(1, args.retrain_epochs + 1):
         epoch_t0 = time.time()
 
-        train_m = run_epoch(model, train_loader, loss_fn, optimizer, device, train=True, ema=ema)
-
-        # Evaluate with EMA weights
-        ema.apply_shadow()
-        val_m = run_epoch(model, val_loader, loss_fn, optimizer, device, train=False)
-        ema.restore()
-
+        train_m = run_epoch(model, train_loader, loss_fn, optimizer, device, train=True)
+        val_m   = run_epoch(model, val_loader, loss_fn, optimizer, device, train=False)
         scheduler.step()
 
         elapsed = time.time() - epoch_t0
@@ -536,24 +447,21 @@ def retrain_cycle(args) -> bool:
             f"  Epoch {epoch:3d}/{args.retrain_epochs} | "
             f"train {train_m['loss']:.5f} | "
             f"val {val_m['loss']:.5f} | "
-            f"EMA-PSNR {val_m['psnr']:.2f} dB | "
+            f"PSNR {val_m['psnr']:.2f} dB | "
             f"SSIM {val_m['ssim']:.4f} | "
             f"{elapsed:.1f}s"
         )
 
-        # Track best within this retrain cycle
         if val_m["psnr"] > best_retrain_psnr:
             best_retrain_psnr  = val_m["psnr"]
             best_retrain_ssim  = val_m["ssim"]
             best_retrain_epoch = epoch
-            # Save EMA state as model_state
-            ema.apply_shadow()
-            best_retrain_state = deepcopy(model.state_dict())
-            ema.restore()
+            import copy
+            best_retrain_state = copy.deepcopy(model.state_dict())
 
     total_time = time.time() - t0
     print(f"\n  Fine-tuning complete in {total_time:.1f}s")
-    print(f"  Best retrain EMA-PSNR: {best_retrain_psnr:.2f} dB (epoch {best_retrain_epoch})")
+    print(f"  Best retrain PSNR: {best_retrain_psnr:.2f} dB (epoch {best_retrain_epoch})")
 
     # --- Step 5: Compare & hot-swap ---
     replaced = False
@@ -599,61 +507,48 @@ def retrain_cycle(args) -> bool:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Auto-retrain IRIS NAFNet when new data arrives",
+        description="Auto-retrain IRIS IRISConditioned model when new data arrives",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
 
     # Paths
-    parser.add_argument("--data_root",      type=str, default=str(DATA_ROOT),
-                        help="Training dataset root (NoisyLR/ + GT/ inside)")
-    parser.add_argument("--new_data_dir",   type=str, default=str(NEW_DATA_DIR),
-                        help="Staging folder for new data (NoisyLR/ + GT/ inside)")
-    parser.add_argument("--checkpoint_dir", type=str, default=str(CHECKPOINT_DIR),
-                        help="Checkpoint directory")
-    parser.add_argument("--production_dir", type=str, default=str(PRODUCTION_DIR),
-                        help="Production model directory (Team-LML/models/)")
-    parser.add_argument("--archive_dir",    type=str, default=str(ARCHIVE_DIR),
-                        help="Archive directory for old models")
-    parser.add_argument("--history_csv",    type=str, default=str(HISTORY_CSV),
-                        help="Path to retrain history log CSV")
+    parser.add_argument("--data_root",      type=str, default=str(DATA_ROOT))
+    parser.add_argument("--new_data_dir",   type=str, default=str(NEW_DATA_DIR))
+    parser.add_argument("--checkpoint_dir", type=str, default=str(CHECKPOINT_DIR))
+    parser.add_argument("--production_dir", type=str, default=str(PRODUCTION_DIR))
+    parser.add_argument("--archive_dir",    type=str, default=str(ARCHIVE_DIR))
+    parser.add_argument("--history_csv",    type=str, default=str(HISTORY_CSV))
 
     # Retraining hyperparameters
-    parser.add_argument("--retrain_epochs", type=int,   default=50,
-                        help="Epochs per retrain cycle (default: 50)")
+    parser.add_argument("--retrain_epochs", type=int,   default=30)
     parser.add_argument("--batch_size",     type=int,   default=8)
     parser.add_argument("--lr",             type=float, default=5e-5,
-                        help="Fine-tuning learning rate (lower than initial training)")
-    parser.add_argument("--weight_decay",   type=float, default=1e-4)
-    parser.add_argument("--ema_decay",      type=float, default=0.999)
+                        help="Fine-tuning learning rate (lower than initial 1e-4)")
     parser.add_argument("--val_fraction",   type=float, default=0.1)
     parser.add_argument("--seed",           type=int,   default=42)
     parser.add_argument("--num_workers",    type=int,   default=2)
-    parser.add_argument("--width",          type=int,   default=32,
-                        help="NAFNet base channel width (for fresh models)")
+    parser.add_argument("--channels",       type=int,   default=112)
+    parser.add_argument("--num_res_blocks", type=int,   default=16)
+    parser.add_argument("--embed_dim",      type=int,   default=32)
 
     # Daemon settings
-    parser.add_argument("--poll_interval",  type=int,   default=60,
-                        help="Seconds between polling for new data (default: 60)")
-    parser.add_argument("--min_new_files",  type=int,   default=1,
-                        help="Minimum new pairs before triggering retrain (default: 1)")
-    parser.add_argument("--once",           action="store_true",
-                        help="Run one cycle then exit (no daemon loop)")
-    parser.add_argument("--dry_run",        action="store_true",
-                        help="Simulate pipeline without training")
+    parser.add_argument("--poll_interval",  type=int,   default=60)
+    parser.add_argument("--min_new_files",  type=int,   default=1)
+    parser.add_argument("--once",           action="store_true")
+    parser.add_argument("--dry_run",        action="store_true")
     args = parser.parse_args()
 
-    # Ensure watch directories exist
     new_data_noisy = Path(args.new_data_dir) / "NoisyLR"
     new_data_gt    = Path(args.new_data_dir) / "GT"
     new_data_noisy.mkdir(parents=True, exist_ok=True)
     new_data_gt.mkdir(parents=True, exist_ok=True)
 
-    # Ensure history CSV exists
     init_history_csv(Path(args.history_csv))
 
     print("=" * 60)
     print("  IRIS Auto-Retrain Pipeline")
     print("=" * 60)
+    print(f"  Model          : IRISConditioned (Experiment 5)")
     print(f"  Data root      : {args.data_root}")
     print(f"  New data watch : {args.new_data_dir}")
     print(f"  Checkpoint dir : {args.checkpoint_dir}")
@@ -668,12 +563,10 @@ def main():
     print()
 
     if args.once:
-        # One-shot mode
         triggered = retrain_cycle(args)
         if not triggered:
             print("No new data found. Nothing to do.")
     else:
-        # Daemon mode — loop forever
         print(f"Watching {args.new_data_dir} for new data "
               f"(checking every {args.poll_interval}s) ...")
         print("Press Ctrl+C to stop.\n")
@@ -682,10 +575,8 @@ def main():
             while True:
                 triggered = retrain_cycle(args)
                 if not triggered:
-                    # No new data — sleep and check again
                     time.sleep(args.poll_interval)
                 else:
-                    # Just finished a retrain cycle — small cooldown then check again
                     print("\nRetrain cycle complete. Resuming watch ...\n")
                     time.sleep(5)
         except KeyboardInterrupt:
