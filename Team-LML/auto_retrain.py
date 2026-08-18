@@ -5,8 +5,8 @@ Automated Retraining Pipeline with Automatic Model Hot-Swap
 This script:
   1. Watches a staging directory (`new_data/`) for new paired NoisyLR + GT files.
   2. Moves matched pairs into the training dataset.
-  3. Fine-tunes the NAFNet model starting from the current best checkpoint.
-  4. Evaluates the new model (with EMA weights) on the validation set.
+  3. Fine-tunes the IRISConditioned model starting from the current best checkpoint.
+  4. Evaluates the new model on the validation set.
   5. Automatically hot-swaps `models/best.pt` IF AND ONLY IF the new model achieves higher PSNR.
   6. Archives replaced models and appends detailed metrics to `retrain_history.csv`.
 
